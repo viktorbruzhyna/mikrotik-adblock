@@ -9,7 +9,7 @@ bash -n "$SCRIPT"
 HELP_OUTPUT=$("$SCRIPT" --help)
 grep -q -- '--dry-run' <<< "$HELP_OUTPUT"
 grep -q -- '192.168.1.1' <<< "$HELP_OUTPUT"
-[[ "$("$SCRIPT" --version)" == "mikrotik-adblock.sh 1.0.0" ]]
+[[ "$("$SCRIPT" --version)" == "mikrotik-adblock.sh 1.0.1" ]]
 
 set +e
 "$SCRIPT" --gateway 999.1.1.1 >/tmp/mikrotik-adblock-smoke.out 2>&1

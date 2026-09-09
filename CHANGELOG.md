@@ -4,6 +4,13 @@ All notable changes to this project will be documented here.
 
 The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning for tagged releases.
 
+## [1.0.1] - 2026-09-09
+
+### Fixed
+
+- GitHub Actions ShellCheck failure caused by intentional RouterOS command expansion over SSH (`SC2029`)
+- centralized RouterOS SSH command execution in a single `ros_exec` helper
+
 ## [1.0.0] - 2026-09-09
 
 ### Added

@@ -17,7 +17,7 @@ IFS=$'\n\t'
 #   ./mikrotik-adblock.sh --dry-run
 
 SCRIPT_NAME="${0##*/}"
-VERSION="1.0.0"
+VERSION="1.0.1"
 DEFAULT_GATEWAY="192.168.1.1"
 DEFAULT_USER="admin"
 DEFAULT_ADLIST_URL="https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
@@ -235,15 +235,25 @@ on_error() {
 }
 trap on_error ERR
 
+ros_exec() {
+  local command=$1
+
+  # RouterOS commands are intentionally constructed on the client and passed as
+  # one remote command string. SC2029 warns about client-side expansion, which
+  # is the desired behavior here; command inputs are validated before use.
+  # shellcheck disable=SC2029
+  ssh "${SSH_OPTS[@]}" "$TARGET" "$command"
+}
+
 ros_read() {
-  ssh "${SSH_OPTS[@]}" "$TARGET" "$1"
+  ros_exec "$1"
 }
 
 ros_write() {
   if (( DRY_RUN )); then
     printf '[DRY-RUN] %s\n' "$1"
   else
-    ssh "${SSH_OPTS[@]}" "$TARGET" "$1"
+    ros_exec "$1"
   fi
 }
 
