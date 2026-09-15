@@ -17,7 +17,7 @@ IFS=$'\n\t'
 #   ./mikrotik-adblock.sh --dry-run
 
 SCRIPT_NAME="${0##*/}"
-VERSION="1.0.3"
+VERSION="1.0.2"
 DEFAULT_GATEWAY="192.168.1.1"
 DEFAULT_USER="admin"
 DEFAULT_ADLIST_URL="https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
@@ -269,9 +269,11 @@ replace_filter_rule() {
   local rule_args=$3
 
   # Recreate managed rules instead of mutating existing ones with `set`.
-  # RouterOS retains unspecified matcher properties on `set`, which can leave a
-  # rule invalid after previous script versions or manual edits.
-  ros_write ":foreach i in=[/ip firewall filter find where comment=\"$legacy_comment\"] do={/ip firewall filter remove \$i}; :foreach i in=[/ip firewall filter find where comment=\"$managed_comment\"] do={/ip firewall filter remove \$i}; /ip firewall filter add $rule_args comment=\"$managed_comment\" place-before=0"
+  # RouterOS CLI row numbers such as `0` are not stable identifiers in scripts
+  # or non-interactive SSH sessions. Also, the first firewall entry can be a
+  # dynamic/built-in FastTrack counter rule, which is not a safe placement
+  # target for a static rule. Insert before the first *static* rule instead.
+  ros_write ":foreach i in=[/ip firewall filter find where comment=\"$legacy_comment\"] do={/ip firewall filter remove \$i}; :foreach i in=[/ip firewall filter find where comment=\"$managed_comment\"] do={/ip firewall filter remove \$i}; :local rules [/ip firewall filter find where dynamic=no]; :if ([:len \$rules] > 0) do={:local first [:pick \$rules 0]; /ip firewall filter add $rule_args comment=\"$managed_comment\" place-before=\$first} else={/ip firewall filter add $rule_args comment=\"$managed_comment\"}"
 }
 
 replace_nat_rule() {
@@ -279,7 +281,9 @@ replace_nat_rule() {
   local managed_comment=$2
   local rule_args=$3
 
-  ros_write ":foreach i in=[/ip firewall nat find where comment=\"$legacy_comment\"] do={/ip firewall nat remove \$i}; :foreach i in=[/ip firewall nat find where comment=\"$managed_comment\"] do={/ip firewall nat remove \$i}; /ip firewall nat add $rule_args comment=\"$managed_comment\" place-before=0"
+  # As above, use RouterOS internal IDs returned by `find` rather than CLI row
+  # numbers, and avoid dynamic/built-in rules as placement targets.
+  ros_write ":foreach i in=[/ip firewall nat find where comment=\"$legacy_comment\"] do={/ip firewall nat remove \$i}; :foreach i in=[/ip firewall nat find where comment=\"$managed_comment\"] do={/ip firewall nat remove \$i}; :local rules [/ip firewall nat find where dynamic=no]; :if ([:len \$rules] > 0) do={:local first [:pick \$rules 0]; /ip firewall nat add $rule_args comment=\"$managed_comment\" place-before=\$first} else={/ip firewall nat add $rule_args comment=\"$managed_comment\"}"
 }
 
 assert_filter_rule_valid() {
@@ -289,7 +293,11 @@ assert_filter_rule_valid() {
   [[ $count == 1 ]] || die "Managed firewall rule '$comment' expected exactly once; found: ${count:-unknown}"
 
   invalid=$(ros_read ":local x [/ip firewall filter find where comment=\"$comment\"]; :put [/ip firewall filter get [:pick \$x 0] invalid]" | tr -d '\r[:space:]' || true)
-  [[ $invalid == false ]] || die "Managed firewall rule is invalid: $comment"
+  if [[ $invalid != false ]]; then
+    warn "RouterOS marked this managed rule invalid; rule details follow:"
+    ros_read "/ip firewall filter print detail where comment=\"$comment\"" >&2 || true
+    die "Managed firewall rule is invalid: $comment"
+  fi
 }
 
 assert_nat_rule_present() {
@@ -388,7 +396,7 @@ if (( DHCP_AVAILABLE )); then
 fi
 
 # Recreate managed firewall rules canonically on every apply. This also migrates
-# rules created by versions <= 1.0.2, whose comments did not use the project prefix.
+# rules created by versions <= 1.0.1, whose comments did not use the project prefix.
 # WAN drops are created first; LAN allows are inserted afterwards at the top so they
 # take precedence while still excluding WAN ingress when a WAN list is available.
 if (( WAN_LIST_AVAILABLE )); then

@@ -10,6 +10,16 @@ bash -n "$SCRIPT"
 # the version probe must explicitly emit it with `:put`.
 grep -Fq ":put [/system resource get version]" "$SCRIPT"
 
+# CLI row numbers (for example place-before=0) are session-dependent and must
+# not be used in RouterOS automation. Rules should use internal IDs from find.
+if grep -Fq 'place-before=0' "$SCRIPT"; then
+  echo "RouterOS automation must not use CLI row number 0 for place-before" >&2
+  exit 1
+fi
+grep -Fq 'place-before=\$first' "$SCRIPT"
+grep -Fq '/ip firewall filter find where dynamic=no' "$SCRIPT"
+grep -Fq '/ip firewall nat find where dynamic=no' "$SCRIPT"
+
 if grep -Fq "\${WHITELIST[@]}" "$SCRIPT"; then
   echo "Direct empty-array expansion of WHITELIST is not Bash 3.2 + nounset safe" >&2
   exit 1
@@ -18,7 +28,7 @@ fi
 HELP_OUTPUT=$("$SCRIPT" --help)
 grep -q -- '--dry-run' <<< "$HELP_OUTPUT"
 grep -q -- '192.168.1.1' <<< "$HELP_OUTPUT"
-[[ "$("$SCRIPT" --version)" == "mikrotik-adblock.sh 1.0.3" ]]
+[[ "$("$SCRIPT" --version)" == "mikrotik-adblock.sh 1.0.2" ]]
 
 set +e
 "$SCRIPT" --gateway 999.1.1.1 >/tmp/mikrotik-adblock-smoke.out 2>&1
