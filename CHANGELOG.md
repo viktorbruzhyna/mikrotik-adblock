@@ -4,6 +4,23 @@ All notable changes to this project will be documented here.
 
 The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning for tagged releases.
 
+## [1.0.3] - 2026-09-15
+
+### Fixed
+
+- recreate script-managed firewall and NAT rules in a canonical form instead of mutating possibly stale rules with `set`
+- migrate legacy unprefixed rule comments created by versions <= 1.0.2
+- validate every managed firewall rule after apply and fail if RouterOS marks it invalid
+- require LAN DNS allow rules to enter from a non-WAN interface when a `WAN` interface list exists
+
+## [1.0.2] - 2026-09-15
+
+### Fixed
+- Fixed RouterOS version detection over non-interactive SSH by explicitly emitting the value with `:put`.
+
+- macOS Bash 3.2 compatibility when `set -u` is enabled and no `--whitelist` options are provided
+- avoid direct expansion of an empty `WHITELIST` array by tracking entries explicitly
+
 ## [1.0.1] - 2026-09-09
 
 ### Fixed

@@ -215,7 +215,7 @@ A loaded list should show a non-zero `name-count`.
 Check forced DNS counters:
 
 ```routeros
-/ip firewall nat print stats where comment~"Force LAN DNS"
+/ip firewall nat print stats where comment~"mikrotik-adblock:"
 ```
 
 From a client, query the router directly:

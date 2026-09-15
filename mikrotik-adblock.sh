@@ -17,7 +17,7 @@ IFS=$'\n\t'
 #   ./mikrotik-adblock.sh --dry-run
 
 SCRIPT_NAME="${0##*/}"
-VERSION="1.0.1"
+VERSION="1.0.3"
 DEFAULT_GATEWAY="192.168.1.1"
 DEFAULT_USER="admin"
 DEFAULT_ADLIST_URL="https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
@@ -38,6 +38,7 @@ DRY_RUN=0
 INSECURE_ADLIST=0
 POSITIONAL_GATEWAY_SEEN=0
 WHITELIST=()
+WHITELIST_COUNT=0
 
 CONTROL_PATH="${TMPDIR:-/tmp}/mikrotik-adblock-$$"
 SSH_OPTS=(
@@ -156,7 +157,8 @@ while (($#)); do
       ;;
     --whitelist)
       (($# >= 2)) || die "$1 requires a domain"
-      WHITELIST+=("$2")
+      WHITELIST[WHITELIST_COUNT]=$2
+      ((WHITELIST_COUNT += 1))
       shift 2
       ;;
     --test-domain)
@@ -213,9 +215,12 @@ is_ipv4 "$GATEWAY_IP" || die "Invalid gateway IPv4 address: $GATEWAY_IP"
 validate_url "$ADLIST_URL" || die "Adlist must be a safe HTTPS URL without quotes/newlines"
 validate_cache_size "$CACHE_SIZE" || die "Invalid cache size: $CACHE_SIZE (example: 32768KiB)"
 is_domain "$TEST_DOMAIN" || die "Invalid test domain: $TEST_DOMAIN"
-for d in "${WHITELIST[@]}"; do
-  is_domain "$d" || die "Invalid whitelist domain: $d"
-done
+if (( WHITELIST_COUNT > 0 )); then
+  for ((i = 0; i < WHITELIST_COUNT; i++)); do
+    d=${WHITELIST[$i]}
+    is_domain "$d" || die "Invalid whitelist domain: $d"
+  done
+fi
 
 TARGET="${ROUTER_USER}@${GATEWAY_IP}"
 
@@ -257,6 +262,43 @@ ros_write() {
   fi
 }
 
+
+replace_filter_rule() {
+  local legacy_comment=$1
+  local managed_comment=$2
+  local rule_args=$3
+
+  # Recreate managed rules instead of mutating existing ones with `set`.
+  # RouterOS retains unspecified matcher properties on `set`, which can leave a
+  # rule invalid after previous script versions or manual edits.
+  ros_write ":foreach i in=[/ip firewall filter find where comment=\"$legacy_comment\"] do={/ip firewall filter remove \$i}; :foreach i in=[/ip firewall filter find where comment=\"$managed_comment\"] do={/ip firewall filter remove \$i}; /ip firewall filter add $rule_args comment=\"$managed_comment\" place-before=0"
+}
+
+replace_nat_rule() {
+  local legacy_comment=$1
+  local managed_comment=$2
+  local rule_args=$3
+
+  ros_write ":foreach i in=[/ip firewall nat find where comment=\"$legacy_comment\"] do={/ip firewall nat remove \$i}; :foreach i in=[/ip firewall nat find where comment=\"$managed_comment\"] do={/ip firewall nat remove \$i}; /ip firewall nat add $rule_args comment=\"$managed_comment\" place-before=0"
+}
+
+assert_filter_rule_valid() {
+  local comment=$1 count invalid
+
+  count=$(ros_read ":put [:len [/ip firewall filter find where comment=\"$comment\"]]" | tr -d '\r[:space:]' || true)
+  [[ $count == 1 ]] || die "Managed firewall rule '$comment' expected exactly once; found: ${count:-unknown}"
+
+  invalid=$(ros_read ":local x [/ip firewall filter find where comment=\"$comment\"]; :put [/ip firewall filter get [:pick \$x 0] invalid]" | tr -d '\r[:space:]' || true)
+  [[ $invalid == false ]] || die "Managed firewall rule is invalid: $comment"
+}
+
+assert_nat_rule_present() {
+  local comment=$1 count
+
+  count=$(ros_read ":put [:len [/ip firewall nat find where comment=\"$comment\"]]" | tr -d '\r[:space:]' || true)
+  [[ $count == 1 ]] || die "Managed NAT rule '$comment' expected exactly once; found: ${count:-unknown}"
+}
+
 routeros_version_ok() {
   local v=$1 major minor rest
   v=${v%% *}
@@ -278,7 +320,7 @@ ros_read ':put "SSH connection OK"' >/dev/null
 ok "SSH connection established"
 
 log "Checking RouterOS version"
-VERSION_RAW=$(ros_read '/system resource get version' | tr -d '\r')
+VERSION_RAW=$(ros_read ':put [/system resource get version]' | tr -d '\r' | tail -n1)
 VERSION=${VERSION_RAW%% *}
 routeros_version_ok "$VERSION_RAW" || die "RouterOS 7.15+ is required; detected: $VERSION_RAW"
 ok "RouterOS $VERSION"
@@ -345,32 +387,40 @@ if (( DHCP_AVAILABLE )); then
   ros_write "/ip dhcp-server network set [find where address=\"$LAN_CIDR\"] dns-server=$GATEWAY_IP"
 fi
 
-# Explicit LAN DNS allows are intentionally narrow. They help strict input firewalls
-# while preserving unrelated router services.
-log "Ensuring LAN clients can query RouterOS DNS"
-ros_write ":local x [/ip firewall filter find where comment=\"Allow LAN DNS UDP\"]; :if ([:len \$x] = 0) do={/ip firewall filter add chain=input src-address=$LAN_CIDR protocol=udp dst-port=53 action=accept comment=\"Allow LAN DNS UDP\" place-before=0} else={/ip firewall filter set [:pick \$x 0] chain=input src-address=$LAN_CIDR protocol=udp dst-port=53 action=accept disabled=no}"
-ros_write ":local x [/ip firewall filter find where comment=\"Allow LAN DNS TCP\"]; :if ([:len \$x] = 0) do={/ip firewall filter add chain=input src-address=$LAN_CIDR protocol=tcp dst-port=53 action=accept comment=\"Allow LAN DNS TCP\" place-before=0} else={/ip firewall filter set [:pick \$x 0] chain=input src-address=$LAN_CIDR protocol=tcp dst-port=53 action=accept disabled=no}"
-
-# Do not expose the router's recursive DNS service to the Internet. Restrict only
-# interfaces already classified by the administrator as WAN; other VPN/LAN ranges
-# are left untouched.
+# Recreate managed firewall rules canonically on every apply. This also migrates
+# rules created by versions <= 1.0.2, whose comments did not use the project prefix.
+# WAN drops are created first; LAN allows are inserted afterwards at the top so they
+# take precedence while still excluding WAN ingress when a WAN list is available.
 if (( WAN_LIST_AVAILABLE )); then
   log "Protecting RouterOS DNS from WAN queries"
-  ros_write ":local x [/ip firewall filter find where comment=\"Block WAN DNS UDP\"]; :if ([:len \$x] = 0) do={/ip firewall filter add chain=input in-interface-list=WAN protocol=udp dst-port=53 action=drop comment=\"Block WAN DNS UDP\" place-before=0} else={/ip firewall filter set [:pick \$x 0] chain=input in-interface-list=WAN protocol=udp dst-port=53 action=drop disabled=no}"
-  ros_write ":local x [/ip firewall filter find where comment=\"Block WAN DNS TCP\"]; :if ([:len \$x] = 0) do={/ip firewall filter add chain=input in-interface-list=WAN protocol=tcp dst-port=53 action=drop comment=\"Block WAN DNS TCP\" place-before=0} else={/ip firewall filter set [:pick \$x 0] chain=input in-interface-list=WAN protocol=tcp dst-port=53 action=drop disabled=no}"
+  replace_filter_rule "Block WAN DNS UDP" "mikrotik-adblock: block WAN DNS UDP" "chain=input in-interface-list=WAN protocol=udp dst-port=53 action=drop"
+  replace_filter_rule "Block WAN DNS TCP" "mikrotik-adblock: block WAN DNS TCP" "chain=input in-interface-list=WAN protocol=tcp dst-port=53 action=drop"
+  LAN_INTERFACE_GUARD="in-interface-list=!WAN "
+else
+  LAN_INTERFACE_GUARD=""
 fi
+
+# Explicit LAN DNS allows help strict input firewalls while preserving unrelated
+# router services. Source CIDR is always required; !WAN additionally prevents a
+# spoofed WAN packet from matching the LAN allow when the WAN list exists.
+log "Ensuring LAN clients can query RouterOS DNS"
+replace_filter_rule "Allow LAN DNS UDP" "mikrotik-adblock: allow LAN DNS UDP" "chain=input ${LAN_INTERFACE_GUARD}src-address=$LAN_CIDR protocol=udp dst-port=53 action=accept"
+replace_filter_rule "Allow LAN DNS TCP" "mikrotik-adblock: allow LAN DNS TCP" "chain=input ${LAN_INTERFACE_GUARD}src-address=$LAN_CIDR protocol=tcp dst-port=53 action=accept"
 
 if (( FORCE_DNS )); then
   log "Forcing external IPv4 DNS/53 requests through MikroTik"
   # dst-address-type=!local avoids NATing clients that already query the router itself.
-  ros_write ":local x [/ip firewall nat find where comment=\"Force LAN DNS UDP\"]; :if ([:len \$x] = 0) do={/ip firewall nat add chain=dstnat src-address=$LAN_CIDR dst-address-type=!local protocol=udp dst-port=53 action=redirect to-ports=53 comment=\"Force LAN DNS UDP\"} else={/ip firewall nat set [:pick \$x 0] chain=dstnat src-address=$LAN_CIDR dst-address-type=!local protocol=udp dst-port=53 action=redirect to-ports=53 disabled=no}"
-  ros_write ":local x [/ip firewall nat find where comment=\"Force LAN DNS TCP\"]; :if ([:len \$x] = 0) do={/ip firewall nat add chain=dstnat src-address=$LAN_CIDR dst-address-type=!local protocol=tcp dst-port=53 action=redirect to-ports=53 comment=\"Force LAN DNS TCP\"} else={/ip firewall nat set [:pick \$x 0] chain=dstnat src-address=$LAN_CIDR dst-address-type=!local protocol=tcp dst-port=53 action=redirect to-ports=53 disabled=no}"
+  replace_nat_rule "Force LAN DNS UDP" "mikrotik-adblock: force LAN DNS UDP" "chain=dstnat src-address=$LAN_CIDR dst-address-type=!local protocol=udp dst-port=53 action=redirect to-ports=53"
+  replace_nat_rule "Force LAN DNS TCP" "mikrotik-adblock: force LAN DNS TCP" "chain=dstnat src-address=$LAN_CIDR dst-address-type=!local protocol=tcp dst-port=53 action=redirect to-ports=53"
 fi
 
-for d in "${WHITELIST[@]}"; do
-  log "Whitelisting $d"
-  ros_write ":local x [/ip dns static find where name=\"$d\" type=FWD]; :if ([:len \$x] = 0) do={/ip dns static add name=\"$d\" type=FWD disabled=no comment=\"AdBlock whitelist\"} else={/ip dns static set [:pick \$x 0] disabled=no}"
-done
+if (( WHITELIST_COUNT > 0 )); then
+  for ((i = 0; i < WHITELIST_COUNT; i++)); do
+    d=${WHITELIST[$i]}
+    log "Whitelisting $d"
+    ros_write ":local x [/ip dns static find where name=\"$d\" type=FWD]; :if ([:len \$x] = 0) do={/ip dns static add name=\"$d\" type=FWD disabled=no comment=\"AdBlock whitelist\"} else={/ip dns static set [:pick \$x 0] disabled=no}"
+  done
+fi
 
 if (( DRY_RUN )); then
   printf '\n[DRY-RUN] No configuration changes were applied.\n'
@@ -392,6 +442,19 @@ done
 (( NAME_COUNT > 0 )) || die "Adlist was configured but contains 0 names. Check '/log print where topics~\"dns\"' on the router."
 ok "Adlist loaded: $NAME_COUNT names"
 
+log "Validating managed firewall rules"
+assert_filter_rule_valid "mikrotik-adblock: allow LAN DNS UDP"
+assert_filter_rule_valid "mikrotik-adblock: allow LAN DNS TCP"
+if (( WAN_LIST_AVAILABLE )); then
+  assert_filter_rule_valid "mikrotik-adblock: block WAN DNS UDP"
+  assert_filter_rule_valid "mikrotik-adblock: block WAN DNS TCP"
+fi
+if (( FORCE_DNS )); then
+  assert_nat_rule_present "mikrotik-adblock: force LAN DNS UDP"
+  assert_nat_rule_present "mikrotik-adblock: force LAN DNS TCP"
+fi
+ok "Managed firewall/NAT rules validated"
+
 printf '\n--- DNS Adlist ---\n'
 ros_read '/ip dns adlist print'
 
@@ -403,11 +466,11 @@ else
 fi
 
 printf '\n--- DNS firewall rules ---\n'
-ros_read '/ip firewall filter print stats where comment~"LAN DNS|WAN DNS"'
+ros_read '/ip firewall filter print stats where comment~"mikrotik-adblock:"'
 
 if (( FORCE_DNS )); then
   printf '\n--- Forced DNS NAT rules ---\n'
-  ros_read '/ip firewall nat print stats where comment~"Force LAN DNS"'
+  ros_read '/ip firewall nat print stats where comment~"mikrotik-adblock:"'
 fi
 
 printf '\n--- DNS test ---\n'
