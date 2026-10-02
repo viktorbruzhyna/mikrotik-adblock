@@ -4,7 +4,7 @@ All notable changes to this project will be documented here.
 
 The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning for tagged releases.
 
-## [1.0.2] - 2026-09-15
+## [1.0.2] - 2026-10-02
 
 ### Fixed
 
@@ -14,12 +14,17 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 - migrate legacy unprefixed rule comments created by versions <= 1.0.1
 - avoid session-dependent RouterOS CLI row numbers such as `place-before=0`; placement now uses internal IDs returned by `find`
 - avoid dynamic/built-in firewall rules as `place-before` targets by selecting the first static rule (`dynamic=no`)
+- walk `find` results with `:foreach`, because a single match is not always an array and indexing it breaks `place-before` and `get`
+- add a replacement firewall/NAT rule before removing the previous one
+- keep the SSH control socket path short enough for the macOS Unix socket limit
+- wait up to 90 seconds for a large Adlist download to report `name-count`
 - validate managed firewall rules after apply and fail if a managed rule is missing or invalid
 
 ### Security
 
 - constrain LAN DNS allow rules with `in-interface-list=!WAN` when a WAN interface list exists
 - keep explicit WAN DNS drop rules ahead of the existing firewall policy
+- enable remote DNS requests only after those firewall rules are installed
 
 ## [1.0.1] - 2026-09-09
 

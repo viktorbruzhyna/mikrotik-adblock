@@ -16,9 +16,12 @@ if grep -Fq 'place-before=0' "$SCRIPT"; then
   echo "RouterOS automation must not use CLI row number 0 for place-before" >&2
   exit 1
 fi
-grep -Fq 'place-before=\$first' "$SCRIPT"
-grep -Fq '/ip firewall filter find where dynamic=no' "$SCRIPT"
-grep -Fq '/ip firewall nat find where dynamic=no' "$SCRIPT"
+grep -Fq "place-before=\\\$first" "$SCRIPT"
+grep -Fq 'find where dynamic=no' "$SCRIPT"
+if grep -Fq '[:pick' "$SCRIPT"; then
+  echo "Do not index RouterOS find results; a single match is not always an array" >&2
+  exit 1
+fi
 
 if grep -Fq "\${WHITELIST[@]}" "$SCRIPT"; then
   echo "Direct empty-array expansion of WHITELIST is not Bash 3.2 + nounset safe" >&2
@@ -93,6 +96,33 @@ grep -Fq '[OK] RouterOS 7.24.2' <<< "$DRY_RUN_OUTPUT"
 grep -Fq '[DRY-RUN] No configuration changes were applied.' <<< "$DRY_RUN_OUTPUT"
 grep -Fq 'mikrotik-adblock: allow LAN DNS UDP' <<< "$DRY_RUN_OUTPUT"
 grep -Fq '/ip firewall filter remove' <<< "$DRY_RUN_OUTPUT"
-grep -Fq 'in-interface-list=!WAN' <<< "$DRY_RUN_OUTPUT"
+grep -Fq '/ip firewall filter find where dynamic=no' <<< "$DRY_RUN_OUTPUT"
+grep -Fq '/ip firewall nat find where dynamic=no' <<< "$DRY_RUN_OUTPUT"
+grep -Fq 'in-interface-list="!WAN"' <<< "$DRY_RUN_OUTPUT"
+ros_place='place-before=$'"first"
+grep -Fq "$ros_place" <<< "$DRY_RUN_OUTPUT"
+if grep -Fq 'type=FWD' <<< "$DRY_RUN_OUTPUT"; then
+  echo "Empty whitelist must not create a static FWD entry" >&2
+  exit 1
+fi
+
+firewall_line=$(grep -n -m 1 'mikrotik-adblock: block WAN DNS UDP' <<< "$DRY_RUN_OUTPUT" | cut -d: -f1)
+dns_line=$(grep -n -m 1 'allow-remote-requests=yes' <<< "$DRY_RUN_OUTPUT" | cut -d: -f1)
+if [[ -z $firewall_line || -z $dns_line || $firewall_line -ge $dns_line ]]; then
+  echo "WAN DNS rules must be installed before allow-remote-requests" >&2
+  exit 1
+fi
+
+add_line=$(grep -n 'allow LAN DNS UDP staging' <<< "$DRY_RUN_OUTPUT" | grep -F "$ros_place" | cut -d: -f1)
+remove_line=$(grep -n 'remove' <<< "$DRY_RUN_OUTPUT" | grep 'comment="mikrotik-adblock: allow LAN DNS UDP"' | cut -d: -f1)
+if [[ -z $add_line || -z $remove_line || $add_line -ge $remove_line ]]; then
+  echo "Replacement rule must be added before the previous managed rule is removed" >&2
+  exit 1
+fi
+
+WHITELIST_OUTPUT=$(PATH="$MOCK_DIR:$PATH" "$SCRIPT" --dry-run --gateway 192.168.1.1 --whitelist example.com)
+grep -Fq 'name="example.com"' <<< "$WHITELIST_OUTPUT"
+grep -Fq 'type=FWD' <<< "$WHITELIST_OUTPUT"
+grep -Fq 'AdBlock whitelist' <<< "$WHITELIST_OUTPUT"
 
 echo "Smoke tests passed"
