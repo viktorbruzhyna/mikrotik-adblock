@@ -266,13 +266,65 @@ ros_write() {
 }
 
 
+# A static rule inserted above the dynamic FastTrack counter is stored and
+# then flagged invalid. `print detail` still shows a normal rule, so the flag
+# is easy to misread as a bad matcher. Append first, then move before the
+# first other static rule inside one script so the id never crosses SSH.
+rule_is_invalid() {
+  local path=$1 comment=$2 invalid
+  invalid=$(ros_read ":foreach i in=[${path} find where comment=\"${comment}\"] do={:put [${path} get \$i invalid]}" | tr -d '\r[:space:]' || true)
+  [[ $invalid != false && $invalid != no ]]
+}
+
+explain_invalid_rule() {
+  local path=$1 comment=$2
+  warn "RouterOS marked this managed rule invalid; rule details follow:"
+  ros_read "${path} print detail where comment=\"${comment}\"" >&2 || true
+  ros_read ":local pos 0; :foreach i in=[${path} find] do={:local c [${path} get \$i comment]; :local inv [${path} get \$i invalid]; :local dyn [${path} get \$i dynamic]; :if (\$c = \"${comment}\") do={:put (\"pos=\" . \$pos . \" invalid=\" . \$inv . \" dynamic=\" . \$dyn)}; :set pos (\$pos + 1)}" >&2 || true
+}
+
+# TCP is protocol 6, which is also the RouterOS default. Adding that default
+# in the same command as dst-port can leave the port matcher without a stored
+# protocol, and the rule stays invalid while print still shows protocol=tcp.
+# A non-default protocol is stored first, then switched to TCP.
+repair_tcp_protocol() {
+  local path=$1 staged=$2
+  ros_write ":foreach i in=[${path} find where comment=\"${staged}\"] do={${path} set \$i protocol=17; ${path} set \$i protocol=6 dst-port=53}"
+  if rule_is_invalid "$path" "$staged"; then
+    ros_write ":foreach i in=[${path} find where comment=\"${staged}\"] do={${path} set \$i protocol=tcp dst-port=53}"
+  fi
+}
+
+append_managed_rule() {
+  local path=$1 rule_args=$2 staged=$3
+  ros_write "${path} add ${rule_args} comment=\"${staged}\""
+  if (( DRY_RUN )); then
+    return 0
+  fi
+  if [[ $rule_args == *"protocol=6"* ]] && rule_is_invalid "$path" "$staged"; then
+    repair_tcp_protocol "$path" "$staged"
+  fi
+}
+
+move_before_first_static() {
+  local path=$1 staged=$2
+  # Skip the rule being moved. The first remaining static id is the anchor,
+  # which keeps the rule below any dynamic entries. A failed move leaves the
+  # rule where it was appended.
+  local command=":local id; :local target; :local seen false; :foreach i in=[${path} find where comment=\"${staged}\"] do={:set id \$i}; :foreach i in=[${path} find where dynamic=no] do={:if (\$seen = false) do={:if (\$i != \$id) do={:set target \$i; :set seen true}}}; :if (\$seen = true) do={${path} move \$id \$target}"
+  if (( DRY_RUN )); then
+    ros_write "$command"
+    return 0
+  fi
+  ros_exec "$command" || warn "Could not move '${staged}' above the existing policy; leaving it at the end of the chain."
+}
+
 # Recreate a managed rule without deleting the previous one first.
-# RouterOS CLI row numbers are not stable over SSH, and the first firewall
-# entry is often a dynamic FastTrack counter that cannot anchor a static rule.
-# A one-item `find` is also not always an array, so indexing it yields the
-# first character of an internal id and `place-before` / `get` fail. `:foreach`
-# binds each id, including that single-id case. The new rule is added before
-# older copies are removed, so a failed insert leaves the previous rule in place.
+# RouterOS CLI row numbers are not stable over SSH. A one-item `find` is also
+# not always an array, so indexing it yields the first character of an
+# internal id and `get` fails. `:foreach` binds each id, including that
+# single-id case. The new rule is added before older copies are removed, so
+# a failed insert leaves the previous rule in place.
 replace_rule() {
   local menu=$1
   local legacy_comment=$2
@@ -282,17 +334,25 @@ replace_rule() {
   local path="/ip firewall ${menu}"
 
   ros_write ":foreach i in=[${path} find where comment=\"${staged}\"] do={${path} remove \$i}"
+  append_managed_rule "$path" "$rule_args" "$staged"
 
-  # Add as its own CLI command. Nested do={} parses "protocol=tcp" as the
-  # default protocol, so dst-port is stored without an explicit protocol and
-  # RouterOS marks that rule invalid. UDP is not the default, which is why
-  # only the TCP rule failed. place-before still uses the first static id.
-  local place
-  place=$(ros_read ":local seen false; :local first; :foreach i in=[${path} find where dynamic=no] do={:if (\$seen = false) do={:set first \$i; :set seen true}}; :if (\$seen = true) do={:put \$first}" | tr -d '\r[:space:]' || true)
-  if [[ $place =~ ^\*[0-9A-Fa-f]+$ ]]; then
-    ros_write "${path} add ${rule_args} comment=\"${staged}\" place-before=${place}"
-  else
-    ros_write "${path} add ${rule_args} comment=\"${staged}\""
+  if (( ! DRY_RUN )) && rule_is_invalid "$path" "$staged"; then
+    explain_invalid_rule "$path" "$staged"
+    ros_write ":foreach i in=[${path} find where comment=\"${staged}\"] do={${path} remove \$i}"
+    die "Managed ${menu} rule is invalid: ${managed_comment}"
+  fi
+
+  move_before_first_static "$path" "$staged"
+
+  if (( ! DRY_RUN )) && rule_is_invalid "$path" "$staged"; then
+    warn "Placing '${managed_comment}' above the existing policy marked it invalid; leaving it at the end of the chain."
+    ros_write ":foreach i in=[${path} find where comment=\"${staged}\"] do={${path} remove \$i}"
+    append_managed_rule "$path" "$rule_args" "$staged"
+    if rule_is_invalid "$path" "$staged"; then
+      explain_invalid_rule "$path" "$staged"
+      ros_write ":foreach i in=[${path} find where comment=\"${staged}\"] do={${path} remove \$i}"
+      die "Managed ${menu} rule is invalid: ${managed_comment}"
+    fi
   fi
 
   ros_write ":foreach i in=[${path} find where comment=\"${legacy_comment}\"] do={${path} remove \$i}; :foreach i in=[${path} find where comment=\"${managed_comment}\"] do={${path} remove \$i}"
@@ -313,15 +373,13 @@ ros_item_count() {
 }
 
 assert_filter_rule_valid() {
-  local comment=$1 count invalid
+  local comment=$1 count
 
   count=$(ros_item_count "/ip firewall filter find where comment=\"${comment}\"")
   [[ $count == 1 ]] || die "Managed firewall rule '$comment' expected exactly once; found: ${count:-unknown}"
 
-  invalid=$(ros_read ":foreach i in=[/ip firewall filter find where comment=\"${comment}\"] do={:put [/ip firewall filter get \$i invalid]}" | tr -d '\r[:space:]' || true)
-  if [[ $invalid != false && $invalid != no ]]; then
-    warn "RouterOS marked this managed rule invalid; rule details follow:"
-    ros_read "/ip firewall filter print detail where comment=\"$comment\"" >&2 || true
+  if rule_is_invalid "/ip firewall filter" "$comment"; then
+    explain_invalid_rule "/ip firewall filter" "$comment"
     die "Managed firewall rule is invalid: $comment"
   fi
 }
@@ -411,7 +469,7 @@ fi
 
 # Install firewall policy before allow-remote-requests=yes. Otherwise the
 # router answers DNS, including from WAN, until later commands finish.
-# Each new rule is inserted before the first static rule, so the last rule
+# Each new rule is moved before the first other static rule, so the last rule
 # created ends up on top. LAN allows are created first; WAN drops are created
 # afterwards and therefore sit above them. A WAN DNS packet hits the drop
 # before the LAN src-address accept. Do not use in-interface-list=!WAN:
@@ -432,6 +490,23 @@ if (( FORCE_DNS )); then
   # dst-address-type=!local avoids NATing clients that already query the router itself.
   replace_nat_rule "Force LAN DNS UDP" "mikrotik-adblock: force LAN DNS UDP" "chain=dstnat src-address=$LAN_CIDR dst-address-type=!local protocol=17 dst-port=53 action=redirect to-ports=53"
   replace_nat_rule "Force LAN DNS TCP" "mikrotik-adblock: force LAN DNS TCP" "chain=dstnat src-address=$LAN_CIDR dst-address-type=!local protocol=6 dst-port=53 action=redirect to-ports=53"
+fi
+
+# Check the rules before the resolver starts answering queries. A failure
+# here leaves allow-remote-requests unchanged.
+if (( ! DRY_RUN )); then
+  log "Validating managed firewall rules"
+  assert_filter_rule_valid "mikrotik-adblock: allow LAN DNS UDP"
+  assert_filter_rule_valid "mikrotik-adblock: allow LAN DNS TCP"
+  if (( WAN_LIST_AVAILABLE )); then
+    assert_filter_rule_valid "mikrotik-adblock: block WAN DNS UDP"
+    assert_filter_rule_valid "mikrotik-adblock: block WAN DNS TCP"
+  fi
+  if (( FORCE_DNS )); then
+    assert_nat_rule_present "mikrotik-adblock: force LAN DNS UDP"
+    assert_nat_rule_present "mikrotik-adblock: force LAN DNS TCP"
+  fi
+  ok "Managed firewall/NAT rules validated"
 fi
 
 log "Configuring RouterOS DNS cache"
@@ -473,19 +548,6 @@ done
 
 (( NAME_COUNT > 0 )) || die "Adlist was configured but contains 0 names after 90 seconds. It may still be downloading. Check '/log print where topics~\"dns\"' on the router."
 ok "Adlist loaded: $NAME_COUNT names"
-
-log "Validating managed firewall rules"
-assert_filter_rule_valid "mikrotik-adblock: allow LAN DNS UDP"
-assert_filter_rule_valid "mikrotik-adblock: allow LAN DNS TCP"
-if (( WAN_LIST_AVAILABLE )); then
-  assert_filter_rule_valid "mikrotik-adblock: block WAN DNS UDP"
-  assert_filter_rule_valid "mikrotik-adblock: block WAN DNS TCP"
-fi
-if (( FORCE_DNS )); then
-  assert_nat_rule_present "mikrotik-adblock: force LAN DNS UDP"
-  assert_nat_rule_present "mikrotik-adblock: force LAN DNS TCP"
-fi
-ok "Managed firewall/NAT rules validated"
 
 printf '\n--- DNS Adlist ---\n'
 ros_read '/ip dns adlist print'

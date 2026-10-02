@@ -10,14 +10,16 @@ bash -n "$SCRIPT"
 # the version probe must explicitly emit it with `:put`.
 grep -Fq ":put [/system resource get version]" "$SCRIPT"
 
-# CLI row numbers (for example place-before=0) are session-dependent and must
-# not be used in RouterOS automation. Rules should use internal IDs from find.
-if grep -Fq 'place-before=0' "$SCRIPT"; then
-  echo "RouterOS automation must not use CLI row number 0 for place-before" >&2
+# CLI row numbers (for example place-before=0) are session-dependent.
+# Inserting a static rule above the dynamic FastTrack counter stores it as
+# invalid, so placement is a move inside one RouterOS script.
+if grep -Fq 'place-before' "$SCRIPT"; then
+  echo "Do not use place-before; a bad anchor stores the rule as invalid" >&2
   exit 1
 fi
-grep -Fq "place-before=\${place}" "$SCRIPT"
 grep -Fq 'find where dynamic=no' "$SCRIPT"
+grep -Fq "set \\\$i protocol=17" "$SCRIPT"
+grep -Fq "set \\\$i protocol=6 dst-port=53" "$SCRIPT"
 if grep -Fq '[:pick' "$SCRIPT"; then
   echo "Do not index RouterOS find results; a single match is not always an array" >&2
   exit 1
@@ -104,8 +106,8 @@ if grep -Fq 'in-interface-list=!WAN' <<< "$DRY_RUN_OUTPUT"; then
   echo "Negated interface lists are invalid inside a RouterOS script" >&2
   exit 1
 fi
-ros_place='place-before=*10'
-grep -Fq "$ros_place" <<< "$DRY_RUN_OUTPUT"
+grep -Fq 'find where dynamic=no' <<< "$DRY_RUN_OUTPUT"
+grep -Fq ' move ' <<< "$DRY_RUN_OUTPUT"
 grep -Fq 'protocol=6' <<< "$DRY_RUN_OUTPUT"
 grep -Fq 'protocol=17' <<< "$DRY_RUN_OUTPUT"
 if grep -Eq 'protocol=tcp|protocol=udp' <<< "$DRY_RUN_OUTPUT"; then
@@ -124,13 +126,13 @@ if [[ -z $firewall_line || -z $dns_line || $firewall_line -ge $dns_line ]]; then
   exit 1
 fi
 
-add_line=$(grep -n 'allow LAN DNS UDP staging' <<< "$DRY_RUN_OUTPUT" | grep -F "$ros_place" | cut -d: -f1)
-wan_add=$(grep -n 'block WAN DNS UDP staging' <<< "$DRY_RUN_OUTPUT" | grep -F "$ros_place" | cut -d: -f1)
+add_line=$(grep -n 'filter add ' <<< "$DRY_RUN_OUTPUT" | grep 'allow LAN DNS UDP staging' | cut -d: -f1)
+wan_add=$(grep -n 'filter add ' <<< "$DRY_RUN_OUTPUT" | grep 'block WAN DNS UDP staging' | cut -d: -f1)
 if [[ -z $add_line || -z $wan_add || $add_line -ge $wan_add ]]; then
   echo "WAN DNS drops must be inserted after LAN allows so they sit above them" >&2
   exit 1
 fi
-remove_line=$(grep -n 'remove' <<< "$DRY_RUN_OUTPUT" | grep 'comment="mikrotik-adblock: allow LAN DNS UDP"' | cut -d: -f1)
+remove_line=$(grep -n -m 1 'allow LAN DNS UDP"' <<< "$DRY_RUN_OUTPUT" | cut -d: -f1)
 if [[ -z $add_line || -z $remove_line || $add_line -ge $remove_line ]]; then
   echo "Replacement rule must be added before the previous managed rule is removed" >&2
   exit 1

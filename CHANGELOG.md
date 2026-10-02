@@ -12,9 +12,9 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 - detect RouterOS version correctly over non-interactive SSH by explicitly printing `get` output with `:put`
 - recreate managed firewall/NAT rules instead of mutating potentially stale rule state
 - migrate legacy unprefixed rule comments created by versions <= 1.0.1
-- avoid session-dependent RouterOS CLI row numbers such as `place-before=0`; placement now uses internal IDs returned by `find`
-- avoid dynamic/built-in firewall rules as `place-before` targets by selecting the first static rule (`dynamic=no`)
-- walk `find` results with `:foreach`, because a single match is not always an array and indexing it breaks `place-before` and `get`
+- avoid session-dependent RouterOS CLI row numbers such as `place-before=0`
+- append a managed rule, then move it before the first other static rule inside one RouterOS script, so it is not inserted above the dynamic FastTrack rule (that position is stored as invalid)
+- walk `find` results with `:foreach`, because a single match is not always an array and indexing it breaks `get`
 - add a replacement firewall/NAT rule before removing the previous one
 - keep the SSH control socket path short enough for the macOS Unix socket limit
 - wait up to 90 seconds for a large Adlist download to report `name-count`
@@ -23,7 +23,7 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 ### Security
 
 - drop WAN DNS above the LAN DNS allows, without `in-interface-list=!WAN` (that matcher is invalid inside a RouterOS script)
-- match TCP and UDP by protocol number (`6` and `17`); a bare `protocol=tcp` follows the default and leaves `dst-port` on an invalid rule
+- match TCP and UDP by protocol number (`6` and `17`); if a TCP port rule is still invalid, store protocol 17 and then switch it to TCP so `dst-port` is not left on the default protocol
 - keep explicit WAN DNS drop rules ahead of the existing firewall policy
 - enable remote DNS requests only after those firewall rules are installed
 
