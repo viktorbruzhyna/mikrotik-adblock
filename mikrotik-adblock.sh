@@ -17,7 +17,7 @@ IFS=$'\n\t'
 #   ./mikrotik-adblock.sh --dry-run
 
 SCRIPT_NAME="${0##*/}"
-VERSION="1.0.1"
+VERSION="1.0.2"
 DEFAULT_GATEWAY="192.168.1.1"
 DEFAULT_USER="admin"
 DEFAULT_ADLIST_URL="https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
@@ -38,8 +38,14 @@ DRY_RUN=0
 INSECURE_ADLIST=0
 POSITIONAL_GATEWAY_SEEN=0
 WHITELIST=()
+WHITELIST_COUNT=0
+SKIPPED_RULES=""
+TCP_RECOVERY_FAILED=0
 
-CONTROL_PATH="${TMPDIR:-/tmp}/mikrotik-adblock-$$"
+# OpenSSH rejects a ControlPath longer than the Unix socket path limit
+# (104 bytes on macOS). $TMPDIR is often already close to that, which makes
+# multiplexing fail before any RouterOS command runs.
+CONTROL_PATH="/tmp/mikrotik-adblock-$$"
 SSH_OPTS=(
   -o "ControlMaster=auto"
   -o "ControlPersist=120"
@@ -156,7 +162,8 @@ while (($#)); do
       ;;
     --whitelist)
       (($# >= 2)) || die "$1 requires a domain"
-      WHITELIST+=("$2")
+      WHITELIST[WHITELIST_COUNT]=$2
+      ((WHITELIST_COUNT += 1))
       shift 2
       ;;
     --test-domain)
@@ -213,9 +220,12 @@ is_ipv4 "$GATEWAY_IP" || die "Invalid gateway IPv4 address: $GATEWAY_IP"
 validate_url "$ADLIST_URL" || die "Adlist must be a safe HTTPS URL without quotes/newlines"
 validate_cache_size "$CACHE_SIZE" || die "Invalid cache size: $CACHE_SIZE (example: 32768KiB)"
 is_domain "$TEST_DOMAIN" || die "Invalid test domain: $TEST_DOMAIN"
-for d in "${WHITELIST[@]}"; do
-  is_domain "$d" || die "Invalid whitelist domain: $d"
-done
+if (( WHITELIST_COUNT > 0 )); then
+  for ((i = 0; i < WHITELIST_COUNT; i++)); do
+    d=${WHITELIST[$i]}
+    is_domain "$d" || die "Invalid whitelist domain: $d"
+  done
+fi
 
 TARGET="${ROUTER_USER}@${GATEWAY_IP}"
 
@@ -257,6 +267,206 @@ ros_write() {
   fi
 }
 
+
+# A static rule inserted above the dynamic FastTrack counter is stored and
+# then flagged invalid. `print detail` still shows a normal rule, so the flag
+# is easy to misread as a bad matcher. Append first, then move before the
+# first other static rule inside one script so the id never crosses SSH.
+rule_is_invalid() {
+  local path=$1 comment=$2 invalid
+  invalid=$(ros_read ":foreach i in=[${path} find where comment=\"${comment}\"] do={:put [${path} get \$i invalid]}" | tr -d '\r[:space:]' || true)
+  [[ $invalid != false && $invalid != no ]]
+}
+
+explain_invalid_rule() {
+  local path=$1 comment=$2
+  warn "RouterOS marked this managed rule invalid; rule details follow:"
+  ros_read "${path} print detail where comment=\"${comment}\"" >&2 || true
+  ros_read "${path} print as-value where comment=\"${comment}\"" >&2 || true
+  ros_read ":local pos 0; :foreach i in=[${path} find] do={:local c [${path} get \$i comment]; :local inv [${path} get \$i invalid]; :local dyn [${path} get \$i dynamic]; :if (\$c = \"${comment}\") do={:put (\"pos=\" . \$pos . \" invalid=\" . \$inv . \" dynamic=\" . \$dyn)}; :set pos (\$pos + 1)}" >&2 || true
+}
+
+rule_was_skipped() {
+  [[ ${SKIPPED_RULES} == *"|$1|"* ]]
+}
+
+remove_commented_rules() {
+  local path=$1 comment=$2
+  ros_exec ":foreach i in=[${path} find where comment=\"${comment}\"] do={${path} remove \$i}" || true
+}
+
+# SSH commands run as RouterOS scripts. protocol=tcp is the default, so a
+# script can store dst-port=53 without an explicit protocol and the rule is
+# marked invalid while print still shows protocol=tcp. An .rsc import uses the
+# CLI parser, which keeps the protocol. A following attempt omits protocol and
+# uses the port matcher.
+import_tcp_rule() {
+  local path=$1 rule_args=$2 staged=$3
+  local cli_args body contents
+  cli_args=${rule_args/protocol=6/protocol=tcp}
+  body="${path} add ${cli_args} comment=\"${staged}\""
+  contents=${body//\"/\\\"}
+  ros_exec "/file remove [find where name=\"mikrotik-adblock-rule.rsc\"]" || true
+  ros_exec "/file add name=mikrotik-adblock-rule.rsc contents=\"${contents}\"" || return 1
+  ros_exec "/import file-name=mikrotik-adblock-rule.rsc" || true
+  ros_exec "/file remove [find where name=\"mikrotik-adblock-rule.rsc\"]" || true
+  return 0
+}
+
+recover_tcp_rule() {
+  local path=$1 rule_args=$2 staged=$3
+  local bare ported
+
+  remove_commented_rules "$path" "$staged"
+  if import_tcp_rule "$path" "$rule_args" "$staged" && ! rule_is_invalid "$path" "$staged"; then
+    return 0
+  fi
+
+  remove_commented_rules "$path" "$staged"
+  bare=${rule_args/protocol=6 /}
+  ros_exec "${path} add ${bare} comment=\"${staged}\"" || true
+  if ! rule_is_invalid "$path" "$staged"; then
+    return 0
+  fi
+
+  remove_commented_rules "$path" "$staged"
+  ported=${bare/dst-port=/port=}
+  if [[ $ported != "$bare" ]]; then
+    ros_exec "${path} add ${ported} comment=\"${staged}\"" || true
+    if ! rule_is_invalid "$path" "$staged"; then
+      return 0
+    fi
+  fi
+
+  explain_invalid_rule "$path" "$staged"
+  remove_commented_rules "$path" "$staged"
+  return 1
+}
+
+append_managed_rule() {
+  local path=$1 rule_args=$2 staged=$3
+  TCP_RECOVERY_FAILED=0
+  ros_write "${path} add ${rule_args} comment=\"${staged}\""
+  if (( DRY_RUN )); then
+    return 0
+  fi
+  if [[ $rule_args == *"protocol=6"* ]] && rule_is_invalid "$path" "$staged"; then
+    if ! recover_tcp_rule "$path" "$rule_args" "$staged"; then
+      TCP_RECOVERY_FAILED=1
+    fi
+  fi
+}
+
+move_before_first_static() {
+  local path=$1 staged=$2
+  # Skip the rule being moved. The first remaining static id is the anchor,
+  # which keeps the rule below any dynamic entries. A failed move leaves the
+  # rule where it was appended.
+  local command=":local id; :local target; :local seen false; :foreach i in=[${path} find where comment=\"${staged}\"] do={:set id \$i}; :foreach i in=[${path} find where dynamic=no] do={:if (\$seen = false) do={:if (\$i != \$id) do={:set target \$i; :set seen true}}}; :if (\$seen = true) do={${path} move \$id \$target}"
+  if (( DRY_RUN )); then
+    ros_write "$command"
+    return 0
+  fi
+  ros_exec "$command" || warn "Could not move '${staged}' above the existing policy; leaving it at the end of the chain."
+}
+
+# Recreate a managed rule without deleting the previous one first.
+# RouterOS CLI row numbers are not stable over SSH. A one-item `find` is also
+# not always an array, so indexing it yields the first character of an
+# internal id and `get` fails. `:foreach` binds each id, including that
+# single-id case. The new rule is added before older copies are removed, so
+# a failed insert leaves the previous rule in place.
+replace_rule() {
+  local menu=$1
+  local legacy_comment=$2
+  local managed_comment=$3
+  local rule_args=$4
+  local staged="${managed_comment} staging"
+  local path="/ip firewall ${menu}"
+
+  ros_write ":foreach i in=[${path} find where comment=\"${staged}\"] do={${path} remove \$i}"
+  append_managed_rule "$path" "$rule_args" "$staged"
+
+  if (( ! DRY_RUN )) && (( TCP_RECOVERY_FAILED )); then
+    warn "RouterOS rejected every TCP/53 form of '${managed_comment}'. Existing firewall policy still applies to that traffic."
+    remove_commented_rules "$path" "$staged"
+    remove_commented_rules "$path" "$legacy_comment"
+    remove_commented_rules "$path" "$managed_comment"
+    SKIPPED_RULES="${SKIPPED_RULES}|${managed_comment}|"
+    return 0
+  fi
+
+  if (( ! DRY_RUN )) && rule_is_invalid "$path" "$staged"; then
+    explain_invalid_rule "$path" "$staged"
+    ros_write ":foreach i in=[${path} find where comment=\"${staged}\"] do={${path} remove \$i}"
+    die "Managed ${menu} rule is invalid: ${managed_comment}"
+  fi
+
+  move_before_first_static "$path" "$staged"
+
+  if (( ! DRY_RUN )) && rule_is_invalid "$path" "$staged"; then
+    warn "Placing '${managed_comment}' above the existing policy marked it invalid; leaving it at the end of the chain."
+    ros_write ":foreach i in=[${path} find where comment=\"${staged}\"] do={${path} remove \$i}"
+    append_managed_rule "$path" "$rule_args" "$staged"
+    if (( TCP_RECOVERY_FAILED )); then
+      warn "RouterOS rejected every TCP/53 form of '${managed_comment}'. Existing firewall policy still applies to that traffic."
+      remove_commented_rules "$path" "$staged"
+      remove_commented_rules "$path" "$legacy_comment"
+      remove_commented_rules "$path" "$managed_comment"
+      SKIPPED_RULES="${SKIPPED_RULES}|${managed_comment}|"
+      return 0
+    fi
+    if rule_is_invalid "$path" "$staged"; then
+      explain_invalid_rule "$path" "$staged"
+      ros_write ":foreach i in=[${path} find where comment=\"${staged}\"] do={${path} remove \$i}"
+      die "Managed ${menu} rule is invalid: ${managed_comment}"
+    fi
+  fi
+
+  ros_write ":foreach i in=[${path} find where comment=\"${legacy_comment}\"] do={${path} remove \$i}; :foreach i in=[${path} find where comment=\"${managed_comment}\"] do={${path} remove \$i}"
+  ros_write ":foreach i in=[${path} find where comment=\"${staged}\"] do={${path} set \$i comment=\"${managed_comment}\"}"
+}
+
+replace_filter_rule() {
+  replace_rule filter "$1" "$2" "$3"
+}
+
+replace_nat_rule() {
+  replace_rule nat "$1" "$2" "$3"
+}
+
+ros_item_count() {
+  local query=$1
+  ros_read ":local n 0; :foreach i in=[${query}] do={:set n (\$n + 1)}; :put \$n" | tr -d '\r[:space:]' || true
+}
+
+assert_filter_rule_valid() {
+  local comment=$1 count
+
+  if rule_was_skipped "$comment"; then
+    return 0
+  fi
+
+  count=$(ros_item_count "/ip firewall filter find where comment=\"${comment}\"")
+  [[ $count == 1 ]] || die "Managed firewall rule '$comment' expected exactly once; found: ${count:-unknown}"
+
+  if rule_is_invalid "/ip firewall filter" "$comment"; then
+    explain_invalid_rule "/ip firewall filter" "$comment"
+    die "Managed firewall rule is invalid: $comment"
+  fi
+}
+
+assert_nat_rule_present() {
+  local comment=$1 count
+
+  if rule_was_skipped "$comment"; then
+    return 0
+  fi
+
+  count=$(ros_item_count "/ip firewall nat find where comment=\"${comment}\"")
+  [[ $count == 1 ]] || die "Managed NAT rule '$comment' expected exactly once; found: ${count:-unknown}"
+}
+
 routeros_version_ok() {
   local v=$1 major minor rest
   v=${v%% *}
@@ -278,14 +488,14 @@ ros_read ':put "SSH connection OK"' >/dev/null
 ok "SSH connection established"
 
 log "Checking RouterOS version"
-VERSION_RAW=$(ros_read '/system resource get version' | tr -d '\r')
+VERSION_RAW=$(ros_read ':put [/system resource get version]' | tr -d '\r' | tail -n1)
 VERSION=${VERSION_RAW%% *}
 routeros_version_ok "$VERSION_RAW" || die "RouterOS 7.15+ is required; detected: $VERSION_RAW"
 ok "RouterOS $VERSION"
 
 if [[ -z $LAN_CIDR ]]; then
   log "Auto-detecting LAN CIDR from DHCP network configuration"
-  LAN_CIDR=$(ros_read ":local x [/ip dhcp-server network find where gateway=\"$GATEWAY_IP\"]; :if ([:len \$x] > 0) do={:put [/ip dhcp-server network get [:pick \$x 0] address]}" 2>/dev/null | tr -d '\r' | tail -n1 || true)
+  LAN_CIDR=$(ros_read ":foreach i in=[/ip dhcp-server network find where gateway=\"$GATEWAY_IP\"] do={:put [/ip dhcp-server network get \$i address]}" 2>/dev/null | tr -d '\r' | tail -n1 || true)
   if ! is_cidr "$LAN_CIDR"; then
     IFS=. read -r o1 o2 o3 _ <<< "$GATEWAY_IP"
     LAN_CIDR="${o1}.${o2}.${o3}.0/24"
@@ -333,44 +543,67 @@ if (( CREATE_BACKUP )); then
   fi
 fi
 
+# Install firewall policy before allow-remote-requests=yes. Otherwise the
+# router answers DNS, including from WAN, until later commands finish.
+# Each new rule is moved before the first other static rule, so the last rule
+# created ends up on top. LAN allows are created first; WAN drops are created
+# afterwards and therefore sit above them. A WAN DNS packet hits the drop
+# before the LAN src-address accept. Do not use in-interface-list=!WAN:
+# inside a RouterOS script "!" is logical NOT, and the rule is marked invalid.
+# Recreating rules also migrates comments from versions <= 1.0.1.
+log "Ensuring LAN clients can query RouterOS DNS"
+replace_filter_rule "Allow LAN DNS UDP" "mikrotik-adblock: allow LAN DNS UDP" "chain=input src-address=$LAN_CIDR protocol=17 dst-port=53 action=accept"
+replace_filter_rule "Allow LAN DNS TCP" "mikrotik-adblock: allow LAN DNS TCP" "chain=input src-address=$LAN_CIDR protocol=6 dst-port=53 action=accept"
+
+if (( WAN_LIST_AVAILABLE )); then
+  log "Protecting RouterOS DNS from WAN queries"
+  replace_filter_rule "Block WAN DNS UDP" "mikrotik-adblock: block WAN DNS UDP" "chain=input in-interface-list=WAN protocol=17 dst-port=53 action=drop"
+  replace_filter_rule "Block WAN DNS TCP" "mikrotik-adblock: block WAN DNS TCP" "chain=input in-interface-list=WAN protocol=6 dst-port=53 action=drop"
+fi
+
+if (( FORCE_DNS )); then
+  log "Forcing external IPv4 DNS/53 requests through MikroTik"
+  # dst-address-type=!local avoids NATing clients that already query the router itself.
+  replace_nat_rule "Force LAN DNS UDP" "mikrotik-adblock: force LAN DNS UDP" "chain=dstnat src-address=$LAN_CIDR dst-address-type=!local protocol=17 dst-port=53 action=redirect to-ports=53"
+  replace_nat_rule "Force LAN DNS TCP" "mikrotik-adblock: force LAN DNS TCP" "chain=dstnat src-address=$LAN_CIDR dst-address-type=!local protocol=6 dst-port=53 action=redirect to-ports=53"
+fi
+
+# Check the rules before the resolver starts answering queries. A failure
+# here leaves allow-remote-requests unchanged.
+if (( ! DRY_RUN )); then
+  log "Validating managed firewall rules"
+  assert_filter_rule_valid "mikrotik-adblock: allow LAN DNS UDP"
+  assert_filter_rule_valid "mikrotik-adblock: allow LAN DNS TCP"
+  if (( WAN_LIST_AVAILABLE )); then
+    assert_filter_rule_valid "mikrotik-adblock: block WAN DNS UDP"
+    assert_filter_rule_valid "mikrotik-adblock: block WAN DNS TCP"
+  fi
+  if (( FORCE_DNS )); then
+    assert_nat_rule_present "mikrotik-adblock: force LAN DNS UDP"
+    assert_nat_rule_present "mikrotik-adblock: force LAN DNS TCP"
+  fi
+  ok "Managed firewall/NAT rules validated"
+fi
+
 log "Configuring RouterOS DNS cache"
 ros_write "/ip dns set allow-remote-requests=yes cache-size=$CACHE_SIZE"
 
 SSL_VERIFY=$([[ $INSECURE_ADLIST -eq 1 ]] && echo no || echo yes)
 log "Configuring Adlist"
-ros_write ":local x [/ip dns adlist find where url=\"$ADLIST_URL\"]; :if ([:len \$x] = 0) do={/ip dns adlist add url=\"$ADLIST_URL\" ssl-verify=$SSL_VERIFY} else={/ip dns adlist set [:pick \$x 0] ssl-verify=$SSL_VERIFY disabled=no}"
+ros_write ":local found false; :foreach i in=[/ip dns adlist find where url=\"$ADLIST_URL\"] do={/ip dns adlist set \$i ssl-verify=$SSL_VERIFY disabled=no; :set found true}; :if (\$found = false) do={/ip dns adlist add url=\"$ADLIST_URL\" ssl-verify=$SSL_VERIFY}"
 
 if (( DHCP_AVAILABLE )); then
   log "Setting DHCP clients to use the MikroTik as DNS"
   ros_write "/ip dhcp-server network set [find where address=\"$LAN_CIDR\"] dns-server=$GATEWAY_IP"
 fi
 
-# Explicit LAN DNS allows are intentionally narrow. They help strict input firewalls
-# while preserving unrelated router services.
-log "Ensuring LAN clients can query RouterOS DNS"
-ros_write ":local x [/ip firewall filter find where comment=\"Allow LAN DNS UDP\"]; :if ([:len \$x] = 0) do={/ip firewall filter add chain=input src-address=$LAN_CIDR protocol=udp dst-port=53 action=accept comment=\"Allow LAN DNS UDP\" place-before=0} else={/ip firewall filter set [:pick \$x 0] chain=input src-address=$LAN_CIDR protocol=udp dst-port=53 action=accept disabled=no}"
-ros_write ":local x [/ip firewall filter find where comment=\"Allow LAN DNS TCP\"]; :if ([:len \$x] = 0) do={/ip firewall filter add chain=input src-address=$LAN_CIDR protocol=tcp dst-port=53 action=accept comment=\"Allow LAN DNS TCP\" place-before=0} else={/ip firewall filter set [:pick \$x 0] chain=input src-address=$LAN_CIDR protocol=tcp dst-port=53 action=accept disabled=no}"
-
-# Do not expose the router's recursive DNS service to the Internet. Restrict only
-# interfaces already classified by the administrator as WAN; other VPN/LAN ranges
-# are left untouched.
-if (( WAN_LIST_AVAILABLE )); then
-  log "Protecting RouterOS DNS from WAN queries"
-  ros_write ":local x [/ip firewall filter find where comment=\"Block WAN DNS UDP\"]; :if ([:len \$x] = 0) do={/ip firewall filter add chain=input in-interface-list=WAN protocol=udp dst-port=53 action=drop comment=\"Block WAN DNS UDP\" place-before=0} else={/ip firewall filter set [:pick \$x 0] chain=input in-interface-list=WAN protocol=udp dst-port=53 action=drop disabled=no}"
-  ros_write ":local x [/ip firewall filter find where comment=\"Block WAN DNS TCP\"]; :if ([:len \$x] = 0) do={/ip firewall filter add chain=input in-interface-list=WAN protocol=tcp dst-port=53 action=drop comment=\"Block WAN DNS TCP\" place-before=0} else={/ip firewall filter set [:pick \$x 0] chain=input in-interface-list=WAN protocol=tcp dst-port=53 action=drop disabled=no}"
+if (( WHITELIST_COUNT > 0 )); then
+  for ((i = 0; i < WHITELIST_COUNT; i++)); do
+    d=${WHITELIST[$i]}
+    log "Whitelisting $d"
+    ros_write ":local found false; :foreach i in=[/ip dns static find where name=\"$d\" type=FWD] do={/ip dns static set \$i disabled=no; :set found true}; :if (\$found = false) do={/ip dns static add name=\"$d\" type=FWD disabled=no comment=\"AdBlock whitelist\"}"
+  done
 fi
-
-if (( FORCE_DNS )); then
-  log "Forcing external IPv4 DNS/53 requests through MikroTik"
-  # dst-address-type=!local avoids NATing clients that already query the router itself.
-  ros_write ":local x [/ip firewall nat find where comment=\"Force LAN DNS UDP\"]; :if ([:len \$x] = 0) do={/ip firewall nat add chain=dstnat src-address=$LAN_CIDR dst-address-type=!local protocol=udp dst-port=53 action=redirect to-ports=53 comment=\"Force LAN DNS UDP\"} else={/ip firewall nat set [:pick \$x 0] chain=dstnat src-address=$LAN_CIDR dst-address-type=!local protocol=udp dst-port=53 action=redirect to-ports=53 disabled=no}"
-  ros_write ":local x [/ip firewall nat find where comment=\"Force LAN DNS TCP\"]; :if ([:len \$x] = 0) do={/ip firewall nat add chain=dstnat src-address=$LAN_CIDR dst-address-type=!local protocol=tcp dst-port=53 action=redirect to-ports=53 comment=\"Force LAN DNS TCP\"} else={/ip firewall nat set [:pick \$x 0] chain=dstnat src-address=$LAN_CIDR dst-address-type=!local protocol=tcp dst-port=53 action=redirect to-ports=53 disabled=no}"
-fi
-
-for d in "${WHITELIST[@]}"; do
-  log "Whitelisting $d"
-  ros_write ":local x [/ip dns static find where name=\"$d\" type=FWD]; :if ([:len \$x] = 0) do={/ip dns static add name=\"$d\" type=FWD disabled=no comment=\"AdBlock whitelist\"} else={/ip dns static set [:pick \$x 0] disabled=no}"
-done
 
 if (( DRY_RUN )); then
   printf '\n[DRY-RUN] No configuration changes were applied.\n'
@@ -382,14 +615,14 @@ ros_read '/ip dns adlist reload' >/dev/null 2>&1 || true
 
 log "Waiting for Adlist to become available"
 NAME_COUNT=0
-for _ in {1..15}; do
-  NAME_COUNT=$(ros_read ":local x [/ip dns adlist find where url=\"$ADLIST_URL\"]; :if ([:len \$x] > 0) do={:put [/ip dns adlist get [:pick \$x 0] name-count]} else={:put 0}" | tr -d '\r[:space:]' || true)
+for _ in {1..45}; do
+  NAME_COUNT=$(ros_read ":local n 0; :foreach i in=[/ip dns adlist find where url=\"$ADLIST_URL\"] do={:set n [/ip dns adlist get \$i name-count]}; :put \$n" | tr -d '\r[:space:]' || true)
   [[ $NAME_COUNT =~ ^[0-9]+$ ]] || NAME_COUNT=0
   (( NAME_COUNT > 0 )) && break
-  sleep 1
+  sleep 2
 done
 
-(( NAME_COUNT > 0 )) || die "Adlist was configured but contains 0 names. Check '/log print where topics~\"dns\"' on the router."
+(( NAME_COUNT > 0 )) || die "Adlist was configured but contains 0 names after 90 seconds. It may still be downloading. Check '/log print where topics~\"dns\"' on the router."
 ok "Adlist loaded: $NAME_COUNT names"
 
 printf '\n--- DNS Adlist ---\n'
@@ -403,11 +636,11 @@ else
 fi
 
 printf '\n--- DNS firewall rules ---\n'
-ros_read '/ip firewall filter print stats where comment~"LAN DNS|WAN DNS"'
+ros_read '/ip firewall filter print stats where comment~"mikrotik-adblock:"'
 
 if (( FORCE_DNS )); then
   printf '\n--- Forced DNS NAT rules ---\n'
-  ros_read '/ip firewall nat print stats where comment~"Force LAN DNS"'
+  ros_read '/ip firewall nat print stats where comment~"mikrotik-adblock:"'
 fi
 
 printf '\n--- DNS test ---\n'

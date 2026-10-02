@@ -135,9 +135,11 @@ When a matching DHCP network exists, clients are configured to use the MikroTik 
 
 ### Firewall
 
-The script adds narrow allow rules for LAN DNS requests. If an interface list named `WAN` exists, it also adds rules that block inbound DNS queries from interfaces classified as WAN.
+Managed rules use a `mikrotik-adblock:` comment and are recreated on each run, including rules left by versions 1.0.1 and earlier. They are installed and checked before `allow-remote-requests` is enabled.
 
-This is important because enabling `allow-remote-requests=yes` turns RouterOS into a DNS resolver for clients, and the resolver should not be exposed to untrusted networks.
+LAN clients are allowed to query the router on TCP/UDP port 53. If an interface list named `WAN` exists, inbound DNS queries from WAN are dropped above those allows, ahead of the rest of the filter policy. If RouterOS rejects a TCP/53 rule, that rule is left out and the existing firewall policy still applies to TCP/53.
+
+This matters because `allow-remote-requests=yes` turns RouterOS into a DNS resolver for clients, and that resolver should not be exposed to untrusted networks.
 
 ### Forced DNS
 
@@ -212,10 +214,11 @@ Check the Adlist:
 
 A loaded list should show a non-zero `name-count`.
 
-Check forced DNS counters:
+Check managed firewall and forced DNS counters:
 
 ```routeros
-/ip firewall nat print stats where comment~"Force LAN DNS"
+/ip firewall filter print stats where comment~"mikrotik-adblock:"
+/ip firewall nat print stats where comment~"mikrotik-adblock:"
 ```
 
 From a client, query the router directly:
