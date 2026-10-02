@@ -98,9 +98,9 @@ grep -Fq 'mikrotik-adblock: allow LAN DNS UDP' <<< "$DRY_RUN_OUTPUT"
 grep -Fq '/ip firewall filter remove' <<< "$DRY_RUN_OUTPUT"
 grep -Fq '/ip firewall filter find where dynamic=no' <<< "$DRY_RUN_OUTPUT"
 grep -Fq '/ip firewall nat find where dynamic=no' <<< "$DRY_RUN_OUTPUT"
-grep -Fq 'in-interface-list=!WAN' <<< "$DRY_RUN_OUTPUT"
-if grep -Fq 'in-interface-list="!WAN"' <<< "$DRY_RUN_OUTPUT"; then
-  echo "Negated WAN list must stay unquoted or RouterOS treats it as a missing list name" >&2
+grep -Fq 'in-interface-list=WAN' <<< "$DRY_RUN_OUTPUT"
+if grep -Fq 'in-interface-list=!WAN' <<< "$DRY_RUN_OUTPUT"; then
+  echo "Negated interface lists are invalid inside a RouterOS script" >&2
   exit 1
 fi
 ros_place='place-before=$'"first"
@@ -118,6 +118,11 @@ if [[ -z $firewall_line || -z $dns_line || $firewall_line -ge $dns_line ]]; then
 fi
 
 add_line=$(grep -n 'allow LAN DNS UDP staging' <<< "$DRY_RUN_OUTPUT" | grep -F "$ros_place" | cut -d: -f1)
+wan_add=$(grep -n 'block WAN DNS UDP staging' <<< "$DRY_RUN_OUTPUT" | grep -F "$ros_place" | cut -d: -f1)
+if [[ -z $add_line || -z $wan_add || $add_line -ge $wan_add ]]; then
+  echo "WAN DNS drops must be inserted after LAN allows so they sit above them" >&2
+  exit 1
+fi
 remove_line=$(grep -n 'remove' <<< "$DRY_RUN_OUTPUT" | grep 'comment="mikrotik-adblock: allow LAN DNS UDP"' | cut -d: -f1)
 if [[ -z $add_line || -z $remove_line || $add_line -ge $remove_line ]]; then
   echo "Replacement rule must be added before the previous managed rule is removed" >&2

@@ -399,25 +399,21 @@ fi
 
 # Install firewall policy before allow-remote-requests=yes. Otherwise the
 # router answers DNS, including from WAN, until later commands finish.
-# WAN drops are created first; LAN allows are inserted afterwards at the top so
-# they take precedence while still excluding WAN ingress when a WAN list exists.
+# Each new rule is inserted before the first static rule, so the last rule
+# created ends up on top. LAN allows are created first; WAN drops are created
+# afterwards and therefore sit above them. A WAN DNS packet hits the drop
+# before the LAN src-address accept. Do not use in-interface-list=!WAN:
+# inside a RouterOS script "!" is logical NOT, and the rule is marked invalid.
 # Recreating rules also migrates comments from versions <= 1.0.1.
+log "Ensuring LAN clients can query RouterOS DNS"
+replace_filter_rule "Allow LAN DNS UDP" "mikrotik-adblock: allow LAN DNS UDP" "chain=input src-address=$LAN_CIDR protocol=udp dst-port=53 action=accept"
+replace_filter_rule "Allow LAN DNS TCP" "mikrotik-adblock: allow LAN DNS TCP" "chain=input src-address=$LAN_CIDR protocol=tcp dst-port=53 action=accept"
+
 if (( WAN_LIST_AVAILABLE )); then
   log "Protecting RouterOS DNS from WAN queries"
   replace_filter_rule "Block WAN DNS UDP" "mikrotik-adblock: block WAN DNS UDP" "chain=input in-interface-list=WAN protocol=udp dst-port=53 action=drop"
   replace_filter_rule "Block WAN DNS TCP" "mikrotik-adblock: block WAN DNS TCP" "chain=input in-interface-list=WAN protocol=tcp dst-port=53 action=drop"
-  # The leading "!" must stay unquoted. Quoted "!WAN" is a literal list name,
-  # which does not exist, so RouterOS marks the rule invalid.
-  LAN_INTERFACE_GUARD="in-interface-list=!WAN "
-else
-  LAN_INTERFACE_GUARD=""
 fi
-
-# Source CIDR is always required. !WAN additionally prevents a spoofed WAN
-# packet from matching the LAN allow when the WAN list exists.
-log "Ensuring LAN clients can query RouterOS DNS"
-replace_filter_rule "Allow LAN DNS UDP" "mikrotik-adblock: allow LAN DNS UDP" "chain=input ${LAN_INTERFACE_GUARD}src-address=$LAN_CIDR protocol=udp dst-port=53 action=accept"
-replace_filter_rule "Allow LAN DNS TCP" "mikrotik-adblock: allow LAN DNS TCP" "chain=input ${LAN_INTERFACE_GUARD}src-address=$LAN_CIDR protocol=tcp dst-port=53 action=accept"
 
 if (( FORCE_DNS )); then
   log "Forcing external IPv4 DNS/53 requests through MikroTik"
