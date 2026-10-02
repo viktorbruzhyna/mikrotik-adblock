@@ -406,7 +406,9 @@ if (( WAN_LIST_AVAILABLE )); then
   log "Protecting RouterOS DNS from WAN queries"
   replace_filter_rule "Block WAN DNS UDP" "mikrotik-adblock: block WAN DNS UDP" "chain=input in-interface-list=WAN protocol=udp dst-port=53 action=drop"
   replace_filter_rule "Block WAN DNS TCP" "mikrotik-adblock: block WAN DNS TCP" "chain=input in-interface-list=WAN protocol=tcp dst-port=53 action=drop"
-  LAN_INTERFACE_GUARD="in-interface-list=\"!WAN\" "
+  # The leading "!" must stay unquoted. Quoted "!WAN" is a literal list name,
+  # which does not exist, so RouterOS marks the rule invalid.
+  LAN_INTERFACE_GUARD="in-interface-list=!WAN "
 else
   LAN_INTERFACE_GUARD=""
 fi

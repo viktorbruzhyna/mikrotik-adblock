@@ -23,6 +23,7 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 ### Security
 
 - constrain LAN DNS allow rules with `in-interface-list=!WAN` when a WAN interface list exists
+- keep that `!WAN` matcher unquoted so RouterOS treats it as negation instead of a missing interface list name
 - keep explicit WAN DNS drop rules ahead of the existing firewall policy
 - enable remote DNS requests only after those firewall rules are installed
 

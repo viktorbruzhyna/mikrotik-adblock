@@ -98,7 +98,11 @@ grep -Fq 'mikrotik-adblock: allow LAN DNS UDP' <<< "$DRY_RUN_OUTPUT"
 grep -Fq '/ip firewall filter remove' <<< "$DRY_RUN_OUTPUT"
 grep -Fq '/ip firewall filter find where dynamic=no' <<< "$DRY_RUN_OUTPUT"
 grep -Fq '/ip firewall nat find where dynamic=no' <<< "$DRY_RUN_OUTPUT"
-grep -Fq 'in-interface-list="!WAN"' <<< "$DRY_RUN_OUTPUT"
+grep -Fq 'in-interface-list=!WAN' <<< "$DRY_RUN_OUTPUT"
+if grep -Fq 'in-interface-list="!WAN"' <<< "$DRY_RUN_OUTPUT"; then
+  echo "Negated WAN list must stay unquoted or RouterOS treats it as a missing list name" >&2
+  exit 1
+fi
 ros_place='place-before=$'"first"
 grep -Fq "$ros_place" <<< "$DRY_RUN_OUTPUT"
 if grep -Fq 'type=FWD' <<< "$DRY_RUN_OUTPUT"; then
