@@ -39,6 +39,8 @@ INSECURE_ADLIST=0
 POSITIONAL_GATEWAY_SEEN=0
 WHITELIST=()
 WHITELIST_COUNT=0
+SKIPPED_RULES=""
+TCP_RECOVERY_FAILED=0
 
 # OpenSSH rejects a ControlPath longer than the Unix socket path limit
 # (104 bytes on macOS). $TMPDIR is often already close to that, which makes
@@ -280,29 +282,78 @@ explain_invalid_rule() {
   local path=$1 comment=$2
   warn "RouterOS marked this managed rule invalid; rule details follow:"
   ros_read "${path} print detail where comment=\"${comment}\"" >&2 || true
+  ros_read "${path} print as-value where comment=\"${comment}\"" >&2 || true
   ros_read ":local pos 0; :foreach i in=[${path} find] do={:local c [${path} get \$i comment]; :local inv [${path} get \$i invalid]; :local dyn [${path} get \$i dynamic]; :if (\$c = \"${comment}\") do={:put (\"pos=\" . \$pos . \" invalid=\" . \$inv . \" dynamic=\" . \$dyn)}; :set pos (\$pos + 1)}" >&2 || true
 }
 
-# TCP is protocol 6, which is also the RouterOS default. Adding that default
-# in the same command as dst-port can leave the port matcher without a stored
-# protocol, and the rule stays invalid while print still shows protocol=tcp.
-# A non-default protocol is stored first, then switched to TCP.
-repair_tcp_protocol() {
-  local path=$1 staged=$2
-  ros_write ":foreach i in=[${path} find where comment=\"${staged}\"] do={${path} set \$i protocol=17; ${path} set \$i protocol=6 dst-port=53}"
-  if rule_is_invalid "$path" "$staged"; then
-    ros_write ":foreach i in=[${path} find where comment=\"${staged}\"] do={${path} set \$i protocol=tcp dst-port=53}"
+rule_was_skipped() {
+  [[ ${SKIPPED_RULES} == *"|$1|"* ]]
+}
+
+remove_commented_rules() {
+  local path=$1 comment=$2
+  ros_exec ":foreach i in=[${path} find where comment=\"${comment}\"] do={${path} remove \$i}" || true
+}
+
+# SSH commands run as RouterOS scripts. protocol=tcp is the default, so a
+# script can store dst-port=53 without an explicit protocol and the rule is
+# marked invalid while print still shows protocol=tcp. An .rsc import uses the
+# CLI parser, which keeps the protocol. A following attempt omits protocol and
+# uses the port matcher.
+import_tcp_rule() {
+  local path=$1 rule_args=$2 staged=$3
+  local cli_args body contents
+  cli_args=${rule_args/protocol=6/protocol=tcp}
+  body="${path} add ${cli_args} comment=\"${staged}\""
+  contents=${body//\"/\\\"}
+  ros_exec "/file remove [find where name=\"mikrotik-adblock-rule.rsc\"]" || true
+  ros_exec "/file add name=mikrotik-adblock-rule.rsc contents=\"${contents}\"" || return 1
+  ros_exec "/import file-name=mikrotik-adblock-rule.rsc" || true
+  ros_exec "/file remove [find where name=\"mikrotik-adblock-rule.rsc\"]" || true
+  return 0
+}
+
+recover_tcp_rule() {
+  local path=$1 rule_args=$2 staged=$3
+  local bare ported
+
+  remove_commented_rules "$path" "$staged"
+  if import_tcp_rule "$path" "$rule_args" "$staged" && ! rule_is_invalid "$path" "$staged"; then
+    return 0
   fi
+
+  remove_commented_rules "$path" "$staged"
+  bare=${rule_args/protocol=6 /}
+  ros_exec "${path} add ${bare} comment=\"${staged}\"" || true
+  if ! rule_is_invalid "$path" "$staged"; then
+    return 0
+  fi
+
+  remove_commented_rules "$path" "$staged"
+  ported=${bare/dst-port=/port=}
+  if [[ $ported != "$bare" ]]; then
+    ros_exec "${path} add ${ported} comment=\"${staged}\"" || true
+    if ! rule_is_invalid "$path" "$staged"; then
+      return 0
+    fi
+  fi
+
+  explain_invalid_rule "$path" "$staged"
+  remove_commented_rules "$path" "$staged"
+  return 1
 }
 
 append_managed_rule() {
   local path=$1 rule_args=$2 staged=$3
+  TCP_RECOVERY_FAILED=0
   ros_write "${path} add ${rule_args} comment=\"${staged}\""
   if (( DRY_RUN )); then
     return 0
   fi
   if [[ $rule_args == *"protocol=6"* ]] && rule_is_invalid "$path" "$staged"; then
-    repair_tcp_protocol "$path" "$staged"
+    if ! recover_tcp_rule "$path" "$rule_args" "$staged"; then
+      TCP_RECOVERY_FAILED=1
+    fi
   fi
 }
 
@@ -336,6 +387,15 @@ replace_rule() {
   ros_write ":foreach i in=[${path} find where comment=\"${staged}\"] do={${path} remove \$i}"
   append_managed_rule "$path" "$rule_args" "$staged"
 
+  if (( ! DRY_RUN )) && (( TCP_RECOVERY_FAILED )); then
+    warn "RouterOS rejected every TCP/53 form of '${managed_comment}'. Existing firewall policy still applies to that traffic."
+    remove_commented_rules "$path" "$staged"
+    remove_commented_rules "$path" "$legacy_comment"
+    remove_commented_rules "$path" "$managed_comment"
+    SKIPPED_RULES="${SKIPPED_RULES}|${managed_comment}|"
+    return 0
+  fi
+
   if (( ! DRY_RUN )) && rule_is_invalid "$path" "$staged"; then
     explain_invalid_rule "$path" "$staged"
     ros_write ":foreach i in=[${path} find where comment=\"${staged}\"] do={${path} remove \$i}"
@@ -348,6 +408,14 @@ replace_rule() {
     warn "Placing '${managed_comment}' above the existing policy marked it invalid; leaving it at the end of the chain."
     ros_write ":foreach i in=[${path} find where comment=\"${staged}\"] do={${path} remove \$i}"
     append_managed_rule "$path" "$rule_args" "$staged"
+    if (( TCP_RECOVERY_FAILED )); then
+      warn "RouterOS rejected every TCP/53 form of '${managed_comment}'. Existing firewall policy still applies to that traffic."
+      remove_commented_rules "$path" "$staged"
+      remove_commented_rules "$path" "$legacy_comment"
+      remove_commented_rules "$path" "$managed_comment"
+      SKIPPED_RULES="${SKIPPED_RULES}|${managed_comment}|"
+      return 0
+    fi
     if rule_is_invalid "$path" "$staged"; then
       explain_invalid_rule "$path" "$staged"
       ros_write ":foreach i in=[${path} find where comment=\"${staged}\"] do={${path} remove \$i}"
@@ -375,6 +443,10 @@ ros_item_count() {
 assert_filter_rule_valid() {
   local comment=$1 count
 
+  if rule_was_skipped "$comment"; then
+    return 0
+  fi
+
   count=$(ros_item_count "/ip firewall filter find where comment=\"${comment}\"")
   [[ $count == 1 ]] || die "Managed firewall rule '$comment' expected exactly once; found: ${count:-unknown}"
 
@@ -386,6 +458,10 @@ assert_filter_rule_valid() {
 
 assert_nat_rule_present() {
   local comment=$1 count
+
+  if rule_was_skipped "$comment"; then
+    return 0
+  fi
 
   count=$(ros_item_count "/ip firewall nat find where comment=\"${comment}\"")
   [[ $count == 1 ]] || die "Managed NAT rule '$comment' expected exactly once; found: ${count:-unknown}"

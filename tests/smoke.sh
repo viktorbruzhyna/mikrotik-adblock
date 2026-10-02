@@ -18,8 +18,8 @@ if grep -Fq 'place-before' "$SCRIPT"; then
   exit 1
 fi
 grep -Fq 'find where dynamic=no' "$SCRIPT"
-grep -Fq "set \\\$i protocol=17" "$SCRIPT"
-grep -Fq "set \\\$i protocol=6 dst-port=53" "$SCRIPT"
+grep -Fq 'mikrotik-adblock-rule.rsc' "$SCRIPT"
+grep -Fq '/import file-name=mikrotik-adblock-rule.rsc' "$SCRIPT"
 if grep -Fq '[:pick' "$SCRIPT"; then
   echo "Do not index RouterOS find results; a single match is not always an array" >&2
   exit 1

@@ -137,7 +137,7 @@ When a matching DHCP network exists, clients are configured to use the MikroTik 
 
 Managed rules use a `mikrotik-adblock:` comment and are recreated on each run, including rules left by versions 1.0.1 and earlier. They are installed and checked before `allow-remote-requests` is enabled.
 
-LAN clients are allowed to query the router on TCP/UDP port 53. If an interface list named `WAN` exists, inbound DNS queries from WAN are dropped above those allows, ahead of the rest of the filter policy.
+LAN clients are allowed to query the router on TCP/UDP port 53. If an interface list named `WAN` exists, inbound DNS queries from WAN are dropped above those allows, ahead of the rest of the filter policy. If RouterOS rejects a TCP/53 rule, that rule is left out and the existing firewall policy still applies to TCP/53.
 
 This matters because `allow-remote-requests=yes` turns RouterOS into a DNS resolver for clients, and that resolver should not be exposed to untrusted networks.
 
