@@ -23,6 +23,7 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 ### Security
 
 - drop WAN DNS above the LAN DNS allows, without `in-interface-list=!WAN` (that matcher is invalid inside a RouterOS script)
+- match TCP and UDP by protocol number (`6` and `17`); a bare `protocol=tcp` follows the default and leaves `dst-port` on an invalid rule
 - keep explicit WAN DNS drop rules ahead of the existing firewall policy
 - enable remote DNS requests only after those firewall rules are installed
 

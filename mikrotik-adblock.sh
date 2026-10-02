@@ -282,7 +282,19 @@ replace_rule() {
   local path="/ip firewall ${menu}"
 
   ros_write ":foreach i in=[${path} find where comment=\"${staged}\"] do={${path} remove \$i}"
-  ros_write ":local seen false; :local first; :foreach i in=[${path} find where dynamic=no] do={:if (\$seen = false) do={:set first \$i; :set seen true}}; :if (\$seen = true) do={${path} add ${rule_args} comment=\"${staged}\" place-before=\$first} else={${path} add ${rule_args} comment=\"${staged}\"}"
+
+  # Add as its own CLI command. Nested do={} parses "protocol=tcp" as the
+  # default protocol, so dst-port is stored without an explicit protocol and
+  # RouterOS marks that rule invalid. UDP is not the default, which is why
+  # only the TCP rule failed. place-before still uses the first static id.
+  local place
+  place=$(ros_read ":local seen false; :local first; :foreach i in=[${path} find where dynamic=no] do={:if (\$seen = false) do={:set first \$i; :set seen true}}; :if (\$seen = true) do={:put \$first}" | tr -d '\r[:space:]' || true)
+  if [[ $place =~ ^\*[0-9A-Fa-f]+$ ]]; then
+    ros_write "${path} add ${rule_args} comment=\"${staged}\" place-before=${place}"
+  else
+    ros_write "${path} add ${rule_args} comment=\"${staged}\""
+  fi
+
   ros_write ":foreach i in=[${path} find where comment=\"${legacy_comment}\"] do={${path} remove \$i}; :foreach i in=[${path} find where comment=\"${managed_comment}\"] do={${path} remove \$i}"
   ros_write ":foreach i in=[${path} find where comment=\"${staged}\"] do={${path} set \$i comment=\"${managed_comment}\"}"
 }
@@ -406,20 +418,20 @@ fi
 # inside a RouterOS script "!" is logical NOT, and the rule is marked invalid.
 # Recreating rules also migrates comments from versions <= 1.0.1.
 log "Ensuring LAN clients can query RouterOS DNS"
-replace_filter_rule "Allow LAN DNS UDP" "mikrotik-adblock: allow LAN DNS UDP" "chain=input src-address=$LAN_CIDR protocol=udp dst-port=53 action=accept"
-replace_filter_rule "Allow LAN DNS TCP" "mikrotik-adblock: allow LAN DNS TCP" "chain=input src-address=$LAN_CIDR protocol=tcp dst-port=53 action=accept"
+replace_filter_rule "Allow LAN DNS UDP" "mikrotik-adblock: allow LAN DNS UDP" "chain=input src-address=$LAN_CIDR protocol=17 dst-port=53 action=accept"
+replace_filter_rule "Allow LAN DNS TCP" "mikrotik-adblock: allow LAN DNS TCP" "chain=input src-address=$LAN_CIDR protocol=6 dst-port=53 action=accept"
 
 if (( WAN_LIST_AVAILABLE )); then
   log "Protecting RouterOS DNS from WAN queries"
-  replace_filter_rule "Block WAN DNS UDP" "mikrotik-adblock: block WAN DNS UDP" "chain=input in-interface-list=WAN protocol=udp dst-port=53 action=drop"
-  replace_filter_rule "Block WAN DNS TCP" "mikrotik-adblock: block WAN DNS TCP" "chain=input in-interface-list=WAN protocol=tcp dst-port=53 action=drop"
+  replace_filter_rule "Block WAN DNS UDP" "mikrotik-adblock: block WAN DNS UDP" "chain=input in-interface-list=WAN protocol=17 dst-port=53 action=drop"
+  replace_filter_rule "Block WAN DNS TCP" "mikrotik-adblock: block WAN DNS TCP" "chain=input in-interface-list=WAN protocol=6 dst-port=53 action=drop"
 fi
 
 if (( FORCE_DNS )); then
   log "Forcing external IPv4 DNS/53 requests through MikroTik"
   # dst-address-type=!local avoids NATing clients that already query the router itself.
-  replace_nat_rule "Force LAN DNS UDP" "mikrotik-adblock: force LAN DNS UDP" "chain=dstnat src-address=$LAN_CIDR dst-address-type=!local protocol=udp dst-port=53 action=redirect to-ports=53"
-  replace_nat_rule "Force LAN DNS TCP" "mikrotik-adblock: force LAN DNS TCP" "chain=dstnat src-address=$LAN_CIDR dst-address-type=!local protocol=tcp dst-port=53 action=redirect to-ports=53"
+  replace_nat_rule "Force LAN DNS UDP" "mikrotik-adblock: force LAN DNS UDP" "chain=dstnat src-address=$LAN_CIDR dst-address-type=!local protocol=17 dst-port=53 action=redirect to-ports=53"
+  replace_nat_rule "Force LAN DNS TCP" "mikrotik-adblock: force LAN DNS TCP" "chain=dstnat src-address=$LAN_CIDR dst-address-type=!local protocol=6 dst-port=53 action=redirect to-ports=53"
 fi
 
 log "Configuring RouterOS DNS cache"

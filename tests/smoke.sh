@@ -16,7 +16,7 @@ if grep -Fq 'place-before=0' "$SCRIPT"; then
   echo "RouterOS automation must not use CLI row number 0 for place-before" >&2
   exit 1
 fi
-grep -Fq "place-before=\\\$first" "$SCRIPT"
+grep -Fq "place-before=\${place}" "$SCRIPT"
 grep -Fq 'find where dynamic=no' "$SCRIPT"
 if grep -Fq '[:pick' "$SCRIPT"; then
   echo "Do not index RouterOS find results; a single match is not always an array" >&2
@@ -81,6 +81,9 @@ case "$command" in
   ':put [:len [/interface list find where name="WAN"]]')
     printf '%s\n' '1'
     ;;
+  *dynamic=no*)
+    printf '%s\n' '*10'
+    ;;
   /tool\ fetch*)
     exit 0
     ;;
@@ -96,15 +99,19 @@ grep -Fq '[OK] RouterOS 7.24.2' <<< "$DRY_RUN_OUTPUT"
 grep -Fq '[DRY-RUN] No configuration changes were applied.' <<< "$DRY_RUN_OUTPUT"
 grep -Fq 'mikrotik-adblock: allow LAN DNS UDP' <<< "$DRY_RUN_OUTPUT"
 grep -Fq '/ip firewall filter remove' <<< "$DRY_RUN_OUTPUT"
-grep -Fq '/ip firewall filter find where dynamic=no' <<< "$DRY_RUN_OUTPUT"
-grep -Fq '/ip firewall nat find where dynamic=no' <<< "$DRY_RUN_OUTPUT"
 grep -Fq 'in-interface-list=WAN' <<< "$DRY_RUN_OUTPUT"
 if grep -Fq 'in-interface-list=!WAN' <<< "$DRY_RUN_OUTPUT"; then
   echo "Negated interface lists are invalid inside a RouterOS script" >&2
   exit 1
 fi
-ros_place='place-before=$'"first"
+ros_place='place-before=*10'
 grep -Fq "$ros_place" <<< "$DRY_RUN_OUTPUT"
+grep -Fq 'protocol=6' <<< "$DRY_RUN_OUTPUT"
+grep -Fq 'protocol=17' <<< "$DRY_RUN_OUTPUT"
+if grep -Eq 'protocol=tcp|protocol=udp' <<< "$DRY_RUN_OUTPUT"; then
+  echo "DNS rules must use protocol numbers 6 and 17" >&2
+  exit 1
+fi
 if grep -Fq 'type=FWD' <<< "$DRY_RUN_OUTPUT"; then
   echo "Empty whitelist must not create a static FWD entry" >&2
   exit 1
