@@ -61,3 +61,9 @@ Out of scope unless explicitly designed as a separate feature:
 - blanket DoH/DoT blocking
 - browser extensions
 - Pi-hole/AdGuard Home installation
+
+## Cursor Cloud specific instructions
+
+The default image already has Bash, OpenSSH, and `nslookup`. Install ShellCheck before the checks under Required checks; there is no service to start.
+
+`--dry-run` opens an SSH session to the gateway. Without a RouterOS host, verify the installer with `bash tests/smoke.sh` (syntax, `--help`, `--version`, and invalid-gateway rejection).
