@@ -21,7 +21,7 @@ bash tests/smoke.sh
 If available:
 
 ```bash
-shellcheck mikrotik-adblock.sh tests/smoke.sh
+shellcheck mikrotik-adblock.sh tests/smoke.sh tests/mock-ssh.sh
 ```
 
 ## Style

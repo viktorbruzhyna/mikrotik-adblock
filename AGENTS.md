@@ -31,7 +31,7 @@ bash tests/smoke.sh
 When available:
 
 ```bash
-shellcheck mikrotik-adblock.sh tests/smoke.sh
+shellcheck mikrotik-adblock.sh tests/smoke.sh tests/mock-ssh.sh
 ```
 
 ## RouterOS compatibility

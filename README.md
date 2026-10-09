@@ -263,7 +263,7 @@ The main rules are: inspect first, prefer `--dry-run`, preserve TLS verification
 
 ## Development
 
-Run local checks:
+Run local checks. `tests/smoke.sh` applies the installer to a local RouterOS stand-in, including a second run, and does not need a router:
 
 ```bash
 bash -n mikrotik-adblock.sh
@@ -273,7 +273,7 @@ bash tests/smoke.sh
 If ShellCheck is installed:
 
 ```bash
-shellcheck mikrotik-adblock.sh tests/smoke.sh
+shellcheck mikrotik-adblock.sh tests/smoke.sh tests/mock-ssh.sh
 ```
 
 GitHub Actions runs syntax checks, smoke tests, and ShellCheck on pushes and pull requests.

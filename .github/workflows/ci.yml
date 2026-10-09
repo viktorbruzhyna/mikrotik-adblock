@@ -24,4 +24,4 @@ jobs:
         run: bash tests/smoke.sh
 
       - name: ShellCheck
-        run: shellcheck mikrotik-adblock.sh tests/smoke.sh
+        run: shellcheck mikrotik-adblock.sh tests/smoke.sh tests/mock-ssh.sh

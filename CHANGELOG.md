@@ -4,7 +4,11 @@ All notable changes to this project will be documented here.
 
 The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning for tagged releases.
 
-## [1.0.2] - 2026-10-02
+## [1.0.2] - 2026-10-09
+
+### Added
+
+- local apply-mode checks that stand in for RouterOS, so the installer can be tested without a router
 
 ### Fixed
 
